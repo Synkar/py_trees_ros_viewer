@@ -15,7 +15,6 @@ Utilities for the py_trees ros viewer.
 # Imports
 ##############################################################################
 
-import rclpy.qos
 
 ##############################################################################
 # Symbols
@@ -53,18 +52,6 @@ def parent_namespace(
     Get the parent namespace of this ros name.
     """
     return "/".join(name.split("/")[:-1])
-
-
-def qos_profile_latched() -> rclpy.qos.QoSProfile:
-    """
-    Convenience retrieval for a latched topic (publisher / subscriber)
-    """
-    return rclpy.qos.QoSProfile(
-        history=rclpy.qos.QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        depth=1,
-        durability=rclpy.qos.QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
-        reliability=rclpy.qos.QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_RELIABLE
-    )
 
 
 def normalise_name_strings(name) -> str:

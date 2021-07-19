@@ -27,8 +27,8 @@ import py_trees_ros_interfaces.msg as py_trees_msgs
 import py_trees_ros_interfaces.srv as py_trees_srvs
 import rcl_interfaces.msg as rcl_msgs
 import rcl_interfaces.srv as rcl_srvs
-import rclpy
-import rclpy.node
+import rospy
+import rosservice
 
 from . import console
 from . import conversions
@@ -74,7 +74,6 @@ class SnapshotStream(object):
 
     def __init__(
         self,
-        node: rclpy.node.Node,
         namespace: str,
         parameters: 'SnapshotStream.Parameters',
         callback: typing.Callable[[py_trees_msgs.BehaviourTree], None],
@@ -90,7 +89,6 @@ class SnapshotStream(object):
 
         self.namespace = namespace
         self.parameters = copy.copy(parameters) if parameters is not None else SnapshotStream.Parameters()
-        self.node = node
         self.callback = callback
 
         self.topic_name = None
@@ -135,12 +133,12 @@ class SnapshotStream(object):
         if self.parameters == parameters:
             return
         self.parameters = copy.copy(parameters)
-        request = self.service_types["reconfigure"].Request()
+        request = self.service_types["reconfigure"]._request_class()
         request.topic_name = self.topic_name
         request.parameters.blackboard_data = self.parameters.blackboard_data
         request.parameters.blackboard_activity = self.parameters.blackboard_activity
         request.parameters.snapshot_period = self.parameters.snapshot_period
-        unused_future = self.services["reconfigure"].call_async(request)
+        unused_response = self.services["reconfigure"](request)
 
     def _connect_on_init(self, timeout_sec=1.0):
         """
@@ -154,42 +152,32 @@ class SnapshotStream(object):
             :class:`~py_trees_ros.exceptions.TimedOutError`: if it times out waiting for the server
         """
         # request a stream
-        request = self.service_types["open"].Request()
+        request = self.service_types["open"]._request_class()
         request.parameters.blackboard_data = self.parameters.blackboard_data
         request.parameters.blackboard_activity = self.parameters.blackboard_activity
         request.parameters.snapshot_period = self.parameters.snapshot_period
         console.logdebug("establishing a snapshot stream connection [{}][backend]".format(self.namespace))
-        future = self.services["open"].call_async(request)
-        rclpy.spin_until_future_complete(self.node, future)
-        response = future.result()
+        response = self.services["open"](request)
         self.topic_name = response.topic_name
         # connect to a snapshot stream
+        self.subscriber = rospy.Subscriber(self.topic_name, py_trees_msgs.BehaviourTree, self.callback, queue_size=1)
         start_time = time.monotonic()
         while True:
             elapsed_time = time.monotonic() - start_time
             if elapsed_time > timeout_sec:
                 raise exceptions.TimedOutError("timed out waiting for a snapshot stream publisher [{}]".format(self.topic_name))
-            if self.node.count_publishers(self.topic_name) > 0:
+            if self.subscriber.get_num_connections() > 0:
                 break
             time.sleep(0.1)
-        self.subscriber = self.node.create_subscription(
-            msg_type=py_trees_msgs.BehaviourTree,
-            topic=self.topic_name,
-            callback=self.callback,
-            qos_profile=utilities.qos_profile_latched()
-        )
         console.logdebug("  ...ok [backend]")
 
     def shutdown(self):
-        if rclpy.ok() and self.services["close"] is not None:
-            request = self.service_types["close"].Request()
+        if self.subscriber is not None:
+            self.subscriber.unregister()
+        if not rospy.is_shutdown() and self.services["close"] is not None:
+            request = self.service_types["close"]._request_class()
             request.topic_name = self.topic_name
-            future = self.services["close"].call_async(request)
-            rclpy.spin_until_future_complete(
-                node=self.node,
-                future=future,
-                timeout_sec=0.5)
-            unused_response = future.result()
+            unused_response = self.services["close"](request)
 
     def create_service_client(self, key: str):
         """
@@ -206,17 +194,14 @@ class SnapshotStream(object):
             raise exceptions.NotReadyError(
                 "no known '{}' service known [did you call setup()?]".format(self.service_types[key])
             )
-        client = self.node.create_client(
-            srv_type=self.service_types[key],
-            srv_name=self.service_names[key],
-            qos_profile=rclpy.qos.qos_profile_services_default
-        )
         # hardcoding timeouts will get us into trouble
-        if not client.wait_for_service(timeout_sec=3.0):
+        try:
+            rospy.wait_for_service(self.service_names[key], timeout=3.0)
+        except:
             raise exceptions.TimedOutError(
                 "timed out waiting for {}".format(self.service_names['close'])
             )
-        return client
+        return rospy.ServiceProxy(self.service_names[key], self.service_types[key])
 
 ##############################################################################
 # Backend
@@ -230,8 +215,6 @@ class Backend(qt_core.QObject):
 
     def __init__(self, parameters):
         super().__init__()
-        default_node_name = "tree_viewer_" + str(os.getpid())
-        self.node = rclpy.create_node(default_node_name)
         self.shutdown_requested = False
         self.snapshot_stream_type = py_trees_msgs.BehaviourTree
         self.discovered_namespaces = []
@@ -247,7 +230,7 @@ class Backend(qt_core.QObject):
     def spin(self):
         with self.lock:
             old_parameters = copy.copy(self.parameters)
-        while rclpy.ok() and not self.shutdown_requested:
+        while not rospy.is_shutdown() and not self.shutdown_requested:
             self.discover_namespaces()
             with self.lock:
                 if self.parameters != old_parameters:
@@ -257,13 +240,12 @@ class Backend(qt_core.QObject):
                 if self.enqueued_connection_request_namespace is not None:
                     self.connect(self.enqueued_connection_request_namespace)
                     self.enqueued_connection_request_namespace = None
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+            rospy.sleep(0.1)
         if self.snapshot_stream is not None:
             self.snapshot_stream.shutdown()
-        self.node.destroy_node()
 
     def terminate_ros_spinner(self):
-        self.node.get_logger().info("shutdown requested [backend]")
+        rospy.loginfo("shutdown requested [backend]")
         self.shutdown_requested = True
 
     def discover_namespaces(self):
@@ -277,9 +259,8 @@ class Backend(qt_core.QObject):
         timeout = self.discovered_timestamp + self.discovery_loop_time_sec
         if self.discovered_namespaces and (time.monotonic() < timeout):
             return
-        open_service_type_string = "py_trees_ros_interfaces/srv/OpenSnapshotStream"
-        service_names_and_types = self.node.get_service_names_and_types()
-        new_service_names = [name for name, types in service_names_and_types if open_service_type_string in types]
+        open_service_type_string = "py_trees_ros_interfaces/OpenSnapshotStream"
+        new_service_names = rosservice.rosservice_find(open_service_type_string)
         new_service_names.sort()
         new_namespaces = [utilities.parent_namespace(name) for name in new_service_names]
         if self.discovered_namespaces != new_namespaces:
@@ -301,7 +282,6 @@ class Backend(qt_core.QObject):
             self.snapshot_stream = None
         console.logdebug("creating a new snapshot stream connection [{}][backend]".format(namespace))
         self.snapshot_stream = SnapshotStream(
-            node=self.node,
             namespace=namespace,
             callback=self.tree_snapshot_handler,
             parameters=self.parameters
@@ -309,13 +289,13 @@ class Backend(qt_core.QObject):
 
     def snapshot_blackboard_data(self, snapshot: bool):
         if self.parameter_client is not None:
-            request = rcl_srvs.SetParameters.Request()  # noqa
+            request = rcl_srvs.SetParameters._request_class()  # noqa
             parameter = rcl_msgs.Parameter()
             parameter.name = "snapshot_blackboard_data"
             parameter.value.type = rcl_msgs.ParameterType.PARAMETER_BOOL  # noqa
             parameter.value.bool_value = snapshot
             request.parameters.append(parameter)
-            unused_future = self.parameter_client.call_async(request)
+            unused_response = self.parameter_client(request)
         self.parameters.snapshot_blackboard_data = snapshot
 
     def tree_snapshot_handler(self, msg: py_trees_msgs.BehaviourTree):
@@ -340,7 +320,7 @@ class Backend(qt_core.QObject):
         }
         tree = {
             'changed': "true" if msg.changed else "false",
-            'timestamp': msg.statistics.stamp.sec + float(msg.statistics.stamp.nanosec) / 1.0e9,
+            'timestamp': msg.statistics.stamp.to_sec(),
             'behaviours': {},
             'blackboard': {'behaviours': {}, 'data': {}},
             'visited_path': []

@@ -27,7 +27,7 @@ import PyQt5.QtCore as qt_core
 import PyQt5.QtWidgets as qt_widgets
 
 import py_trees_js
-import rclpy
+import rospy
 
 from . import backend as ros_backend
 from . import console
@@ -149,7 +149,7 @@ def main():
     console.log_level = console.LogLevel.DEBUG
 
     # ros init
-    rclpy.init()
+    rospy.init_node('py_trees_ros_viewer', anonymous=True)
 
     # the players
     app = qt_widgets.QApplication(sys.argv)
@@ -231,7 +231,7 @@ def main():
     result = app.exec_()
 
     # shutdown
-    backend.node.get_logger().info("waiting for backend to terminate [viewer]")
+    rospy.loginfo("waiting for backend to terminate [viewer]")
     ros_thread.join()
-    rclpy.shutdown()
+    rospy.signal_shutdown('Application finished')
     sys.exit(result)
